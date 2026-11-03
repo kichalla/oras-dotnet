@@ -12,6 +12,7 @@
 // limitations under the License.
 
 using OrasProject.Oras.Content;
+using OrasProject.Oras.Exceptions;
 using OrasProject.Oras.Oci;
 using System.Collections.Concurrent;
 using System.Formats.Tar;
@@ -535,21 +536,18 @@ public class CopyTest
                 node.MediaType == MediaType.ImageConfig ? new[] { shared } : Array.Empty<Descriptor>())
         };
         var proxy = new Proxy { Source = source, Cache = new MemoryStore() };
-        using var limiter = new SemaphoreSlim(options.Concurrency, options.Concurrency);
-        var copied = new ConcurrentDictionary<BasicDescriptor, Lazy<Task>>();
         var lookups = new DependencyLookupCounter();
-        var parents = new Dictionary<BasicDescriptor, List<BasicDescriptor>>(lookups);
-        var nodesWithSuccessors = new HashSet<BasicDescriptor>();
-
-        await source.CopyGraphAsync(
-            destination, shared, proxy, options, limiter, copied, parents, nodesWithSuccessors, deadline.Token);
+        var roots = new List<Descriptor> { shared };
         for (var i = 0; i < parentCount; i++)
         {
-            var parent = await PushContentAsync(
-                source, Encoding.UTF8.GetBytes($"parent-{i}"), MediaType.ImageConfig, deadline.Token);
-            await source.CopyGraphAsync(
-                destination, parent, proxy, options, limiter, copied, parents, nodesWithSuccessors, deadline.Token);
-            Assert.True(await destination.ExistsAsync(parent, deadline.Token));
+            roots.Add(await PushContentAsync(
+                source, Encoding.UTF8.GetBytes($"parent-{i}"), MediaType.ImageConfig, deadline.Token));
+        }
+        var operation = new CopyGraphOperation(destination, proxy, options, lookups);
+        await operation.RunAsync(roots, deadline.Token);
+        foreach (var root in roots)
+        {
+            Assert.True(await destination.ExistsAsync(root, deadline.Token));
         }
 
         // Count graph lookups rather than elapsed time to catch repeated scans without timing flakiness.
@@ -588,14 +586,9 @@ public class CopyTest
                     ? new[] { successor } : Array.Empty<Descriptor>())
         };
         var proxy = new Proxy { Source = source, Cache = new MemoryStore() };
-        using var limiter = new SemaphoreSlim(options.Concurrency, options.Concurrency);
-        var copied = new ConcurrentDictionary<BasicDescriptor, Lazy<Task>>();
         var lookups = new DependencyLookupCounter();
-        var parents = new Dictionary<BasicDescriptor, List<BasicDescriptor>>(lookups);
-        var nodesWithSuccessors = new HashSet<BasicDescriptor>();
-
-        await source.CopyGraphAsync(
-            destination, nodes[0], proxy, options, limiter, copied, parents, nodesWithSuccessors, deadline.Token);
+        var operation = new CopyGraphOperation(destination, proxy, options, lookups);
+        await operation.RunAsync(new[] { nodes[0] }, deadline.Token);
 
         Assert.True(lookups.HashCalls <= 8 * nodeCount,
             $"Expected linear graph lookups, but observed {lookups.HashCalls} for a {nodeCount}-node chain.");
@@ -635,14 +628,9 @@ public class CopyTest
         }
         var options = new CopyGraphOptions { Concurrency = concurrency };
         var proxy = new Proxy { Source = source, Cache = new MemoryStore() };
-        using var limiter = new SemaphoreSlim(concurrency, concurrency);
-        var copied = new ConcurrentDictionary<BasicDescriptor, Lazy<Task>>();
         var lookups = new DependencyLookupCounter();
-        var parents = new Dictionary<BasicDescriptor, List<BasicDescriptor>>(lookups);
-        var nodesWithSuccessors = new HashSet<BasicDescriptor>();
-
-        await source.CopyGraphAsync(
-            destination, manifests[^1], proxy, options, limiter, copied, parents, nodesWithSuccessors, deadline.Token);
+        var operation = new CopyGraphOperation(destination, proxy, options, lookups);
+        await operation.RunAsync(new[] { manifests[^1] }, deadline.Token);
 
         Assert.True(lookups.HashCalls <= 8 * (manifestCount + 1),
             $"Expected linear graph lookups, but observed {lookups.HashCalls} " +
@@ -836,49 +824,41 @@ public class CopyTest
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
         var graph = await CreateSharedLayerGraphAsync(deadline.Token);
         var destination = new DependencyCheckingTarget(graph.Layer);
-        var options = new CopyGraphOptions { Concurrency = 1 };
+        var skippedCount = 0;
+        var options = new CopyGraphOptions
+        {
+            Concurrency = 1,
+            OnCopySkippedAsync = (_, _) =>
+            {
+                Interlocked.Increment(ref skippedCount);
+                return Task.CompletedTask;
+            }
+        };
         var proxy = new Proxy { Source = graph.Source, Cache = new MemoryStore() };
-        using var limiter = new SemaphoreSlim(1, 1);
-        var copied = new ConcurrentDictionary<BasicDescriptor, Lazy<Task>>();
-        var parents = new Dictionary<BasicDescriptor, List<BasicDescriptor>>();
-        var nodesWithSuccessors = new HashSet<BasicDescriptor>();
-        var owner = graph.Source.CopyGraphAsync(
-            destination, graph.Layer, proxy, options, limiter,
-            copied, parents, nodesWithSuccessors, cancellation.Token);
-        Task? duplicate = null;
+        var operation = new CopyGraphOperation(destination, proxy, options);
+        var copy = operation.RunAsync(new[] { graph.Layer, graph.Layer }, cancellation.Token);
         try
         {
             await destination.LayerUploadStarted.Task.WaitAsync(deadline.Token);
-            Assert.False(owner.IsCompleted);
-
-            // This call reaches the existing Lazy synchronously, before returning its pending Task.
-            duplicate = graph.Source.CopyGraphAsync(
-                destination, graph.Layer, proxy, options, limiter,
-                copied, parents, nodesWithSuccessors, cancellation.Token);
-            Assert.False(duplicate.IsCompleted);
-            Assert.Single(copied);
+            Assert.False(copy.IsCompleted);
+            Assert.Equal(0, Volatile.Read(ref skippedCount));
 
             await cancellation.CancelAsync();
-            var ownerError = await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => owner.WaitAsync(deadline.Token));
-            var duplicateError = await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                () => duplicate.WaitAsync(deadline.Token));
+            var error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => copy.WaitAsync(deadline.Token));
 
-            Assert.Equal(cancellation.Token, ownerError.CancellationToken);
-            Assert.Equal(cancellation.Token, duplicateError.CancellationToken);
-            Assert.True(owner.IsCanceled);
-            Assert.True(duplicate.IsCanceled);
+            Assert.Equal(cancellation.Token, error.CancellationToken);
+            Assert.True(copy.IsCanceled);
             Assert.False(deadline.IsCancellationRequested);
             Assert.Equal(1, destination.SharedLayerUploadCount);
+            Assert.Equal(0, Volatile.Read(ref skippedCount));
         }
         finally
         {
             await cancellation.CancelAsync();
             destination.ReleaseLayerUpload();
-            // Observe both tasks during cleanup even if an assertion above fails.
-            await Task.WhenAll(owner, duplicate ?? Task.CompletedTask)
-                .ConfigureAwait(
-                    ConfigureAwaitOptions.SuppressThrowing | ConfigureAwaitOptions.ContinueOnCapturedContext);
+            await copy.ConfigureAwait(
+                ConfigureAwaitOptions.SuppressThrowing | ConfigureAwaitOptions.ContinueOnCapturedContext);
         }
     }
 
@@ -1005,6 +985,364 @@ public class CopyTest
         Assert.Equal(1, destination.SharedLayerUploadCount);
     }
 
+    [Theory]
+    [InlineData("discovery")]
+    [InlineData("post")]
+    [InlineData("skip")]
+    public async Task CopyGraphAsync_WaitsForLastActiveWorker_ThenSchedulesItsConsequencesAsync(string phase)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var source = new MemoryStore();
+        var root = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("root"), MediaType.ImageConfig, deadline.Token);
+        var child = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("child"), MediaType.ImageConfig, deadline.Token);
+        var destination = new MemoryStore();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async Task GateAsync(CancellationToken cancellationToken)
+        {
+            started.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+        }
+
+        var options = new CopyGraphOptions
+        {
+            Concurrency = 1,
+            FindSuccessorsAsync = async (_, node, cancellationToken) =>
+            {
+                if (node == root && phase == "discovery")
+                {
+                    await GateAsync(cancellationToken);
+                }
+                return node == root
+                    ? Enumerable.Repeat(child, phase == "skip" ? 2 : 1)
+                    : Array.Empty<Descriptor>();
+            },
+            PostCopyAsync = (node, cancellationToken) =>
+                node == child && phase == "post" ? GateAsync(cancellationToken) : Task.CompletedTask,
+            OnCopySkippedAsync = (_, cancellationToken) => GateAsync(cancellationToken)
+        };
+        var copy = source.CopyGraphAsync(destination, root, options, deadline.Token);
+        try
+        {
+            await started.Task.WaitAsync(deadline.Token);
+            Assert.False(copy.IsCompleted);
+            Assert.False(await destination.ExistsAsync(root, deadline.Token));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await copy;
+        }
+        Assert.True(await destination.ExistsAsync(root, deadline.Token));
+        Assert.True(await destination.ExistsAsync(child, deadline.Token));
+    }
+
+    [Fact]
+    public async Task CopyGraphAsync_CopiesReadyBranch_WhileAnotherBranchIsStillDiscoveringAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var source = new MemoryStore();
+        var root = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("root"), MediaType.ImageConfig, deadline.Token);
+        var slow = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("slow"), MediaType.ImageConfig, deadline.Token);
+        var fast = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("fast"), MediaType.ImageConfig, deadline.Token);
+        var destination = new MemoryStore();
+        var discovering = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var copied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new CopyGraphOptions
+        {
+            Concurrency = 2,
+            FindSuccessorsAsync = async (_, node, cancellationToken) =>
+            {
+                if (node == slow)
+                {
+                    discovering.TrySetResult();
+                    await release.Task.WaitAsync(cancellationToken);
+                }
+                return node == root ? new[] { slow, fast } : Array.Empty<Descriptor>();
+            },
+            PostCopyAsync = (node, _) =>
+            {
+                if (node == fast)
+                {
+                    copied.TrySetResult();
+                }
+                return Task.CompletedTask;
+            }
+        };
+        var copy = source.CopyGraphAsync(destination, root, options, deadline.Token);
+        try
+        {
+            await discovering.Task.WaitAsync(deadline.Token);
+            await copied.Task.WaitAsync(deadline.Token);
+            Assert.False(copy.IsCompleted);
+            Assert.True(await destination.ExistsAsync(fast, deadline.Token));
+            Assert.False(await destination.ExistsAsync(slow, deadline.Token));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await copy;
+        }
+        Assert.True(await destination.ExistsAsync(root, deadline.Token));
+    }
+
+    [Fact]
+    public async Task CopyGraphAsync_DuplicateSkipCallbacks_DoNotConsumeCopySlotsAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var source = new MemoryStore();
+        var shared = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("shared"), MediaType.ImageConfig, deadline.Token);
+        var other = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("other"), MediaType.ImageConfig, deadline.Token);
+        var skipped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var copied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new CopyGraphOptions
+        {
+            Concurrency = 1,
+            PostCopyAsync = async (node, cancellationToken) =>
+            {
+                if (node == other)
+                {
+                    await skipped.Task.WaitAsync(cancellationToken);
+                    copied.TrySetResult();
+                }
+            },
+            OnCopySkippedAsync = async (node, cancellationToken) =>
+            {
+                Assert.Same(shared, node);
+                skipped.TrySetResult();
+                await copied.Task.WaitAsync(cancellationToken);
+            }
+        };
+        var destination = new MemoryStore();
+        var operation = new CopyGraphOperation(destination,
+            new Proxy { Source = source, Cache = new MemoryStore() }, options);
+
+        await operation.RunAsync(new[] { shared, shared, other }, deadline.Token);
+
+        Assert.False(deadline.IsCancellationRequested);
+        Assert.True(await destination.ExistsAsync(other, deadline.Token));
+    }
+
+    [Fact]
+    public async Task CopyAsync_DuplicateSkipFailure_BlocksOnlyItsDependentsAndFinalTagAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var source = new MemoryStore();
+        var root = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("root"), MediaType.ImageConfig, deadline.Token);
+        var parent = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("parent"), MediaType.ImageConfig, deadline.Token);
+        var leaf = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("leaf"), MediaType.ImageConfig, deadline.Token);
+        var independent = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("independent"), MediaType.ImageConfig, deadline.Token);
+        var duplicate = new Descriptor
+        {
+            MediaType = leaf.MediaType,
+            Digest = leaf.Digest,
+            Size = leaf.Size,
+            Annotations = new Dictionary<string, string> { ["occurrence"] = "duplicate" }
+        };
+        await source.TagAsync(root, "image", deadline.Token);
+        var destination = new MemoryStore();
+        var failure = new IOException("Duplicate skip callback failed.");
+        var skipped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var skipCount = 0;
+        var options = new CopyOptions
+        {
+            FindSuccessorsAsync = async (_, node, cancellationToken) =>
+            {
+                if (node == independent)
+                {
+                    await skipped.Task.WaitAsync(cancellationToken);
+                }
+                return node == root ? new[] { parent, independent } :
+                    node == parent ? new[] { leaf, duplicate, duplicate } : Array.Empty<Descriptor>();
+            },
+            OnCopySkippedAsync = (node, _) =>
+            {
+                Assert.Same(duplicate, node);
+                Interlocked.Increment(ref skipCount);
+                skipped.TrySetResult();
+                return Task.FromException(failure);
+            }
+        };
+
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => source.CopyAsync("image", destination, "copied", options, deadline.Token));
+
+        Assert.Same(failure, error);
+        Assert.Equal(2, Volatile.Read(ref skipCount));
+        Assert.True(await destination.ExistsAsync(leaf, deadline.Token));
+        Assert.True(await destination.ExistsAsync(independent, deadline.Token));
+        Assert.False(await destination.ExistsAsync(parent, deadline.Token));
+        Assert.False(await destination.ExistsAsync(root, deadline.Token));
+        await Assert.ThrowsAsync<NotFoundException>(() => destination.ResolveAsync("copied", deadline.Token));
+    }
+
+    [Fact]
+    public async Task CopyGraphAsync_PrefersFaultOverPeerCancellation_AfterDrainingWorkersAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
+        var source = new MemoryStore();
+        var root = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("root"), MediaType.ImageConfig, deadline.Token);
+        var faulted = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("faulted"), MediaType.ImageConfig, deadline.Token);
+        var canceled = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("canceled"), MediaType.ImageConfig, deadline.Token);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbackCount = 0;
+        var failure = new IOException("Fault during peer cancellation.");
+        var destination = new MemoryStore();
+        var options = new CopyGraphOptions
+        {
+            FindSuccessorsAsync = (_, node, _) => Task.FromResult<IEnumerable<Descriptor>>(
+                node == root ? new[] { faulted, canceled } : []),
+            PostCopyAsync = async (node, cancellationToken) =>
+            {
+                if (Interlocked.Increment(ref callbackCount) == 2)
+                {
+                    started.TrySetResult();
+                }
+                if (node == faulted)
+                {
+                    await cancelObserved.Task.WaitAsync(deadline.Token);
+                    throw failure;
+                }
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, cancellationToken);
+                }
+                finally
+                {
+                    cancelObserved.TrySetResult();
+                }
+            }
+        };
+        var copy = source.CopyGraphAsync(destination, root, options, cancellation.Token);
+        try
+        {
+            await started.Task.WaitAsync(deadline.Token);
+            await cancellation.CancelAsync();
+            var error = await Assert.ThrowsAsync<IOException>(() => copy);
+            Assert.Same(failure, error);
+            Assert.True(copy.IsFaulted);
+            Assert.False(deadline.IsCancellationRequested);
+            Assert.False(await destination.ExistsAsync(root, deadline.Token));
+        }
+        finally
+        {
+            await cancellation.CancelAsync();
+            await copy.ConfigureAwait(
+                ConfigureAwaitOptions.SuppressThrowing | ConfigureAwaitOptions.ContinueOnCapturedContext);
+        }
+    }
+
+    [Fact]
+    public async Task CopyGraphAsync_ReportsCycle_OnlyAfterActiveHealthyBranchFinishesAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var source = new MemoryStore();
+        var root = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("root"), MediaType.ImageConfig, deadline.Token);
+        var cycle = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("cycle"), MediaType.ImageConfig, deadline.Token);
+        var healthy = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("healthy"), MediaType.ImageConfig, deadline.Token);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var destination = new MemoryStore();
+        var options = new CopyGraphOptions
+        {
+            FindSuccessorsAsync = (_, node, _) => Task.FromResult<IEnumerable<Descriptor>>(
+                node == root ? new[] { cycle, healthy } : node == cycle ? new[] { cycle } : []),
+            PostCopyAsync = async (node, cancellationToken) =>
+            {
+                if (node == healthy)
+                {
+                    started.TrySetResult();
+                    await release.Task.WaitAsync(cancellationToken);
+                }
+            }
+        };
+        var copy = source.CopyGraphAsync(destination, root, options, deadline.Token);
+        try
+        {
+            await started.Task.WaitAsync(deadline.Token);
+            Assert.False(copy.IsCompleted);
+        }
+        finally
+        {
+            release.TrySetResult();
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => copy);
+            Assert.Contains("Dependency cycle", error.Message);
+        }
+        Assert.False(deadline.IsCancellationRequested);
+        Assert.True(await destination.ExistsAsync(healthy, deadline.Token));
+        Assert.False(await destination.ExistsAsync(cycle, deadline.Token));
+        Assert.False(await destination.ExistsAsync(root, deadline.Token));
+    }
+
+    [Theory]
+    [InlineData(64, 1)]
+    [InlineData(512, 1)]
+    [InlineData(512, 3)]
+    public async Task CopyGraphAsync_SharedNonLeafChain_UsesLinearLookupsAndOneFetchPerObjectAsync(
+        int indexCount, int concurrency)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var source = new MemoryStore();
+        var config = await PushContentAsync(
+            source, Encoding.UTF8.GetBytes("{}"), MediaType.ImageConfig, deadline.Token);
+        var shared = await PushContentAsync(source, JsonSerializer.SerializeToUtf8Bytes(new Manifest
+        {
+            SchemaVersion = 2,
+            MediaType = MediaType.ImageManifest,
+            Config = config,
+            Layers = Array.Empty<Descriptor>()
+        }), MediaType.ImageManifest, deadline.Token);
+        Descriptor? previous = null;
+        for (var i = 0; i < indexCount; i++)
+        {
+            previous = await PushContentAsync(source,
+                JsonSerializer.SerializeToUtf8Bytes(new OrasProject.Oras.Oci.Index
+                {
+                    SchemaVersion = 2,
+                    MediaType = MediaType.ImageIndex,
+                    Manifests = previous == null ? new[] { shared } : new[] { previous, shared }
+                }), MediaType.ImageIndex, deadline.Token);
+        }
+        var countedSource = new CountingStorage(source);
+        var destination = new CountingStorage(new MemoryStore());
+        var lookups = new DependencyLookupCounter();
+        var operation = new CopyGraphOperation(destination,
+            new Proxy { Source = countedSource, Cache = new MemoryStore() },
+            new CopyGraphOptions { Concurrency = concurrency }, lookups);
+
+        await operation.RunAsync(new[] { previous! }, deadline.Token);
+
+        var vertexCount = indexCount + 2;
+        var edgeCount = 2 * indexCount;
+        // At most two node-map lookups per vertex and one per dependency; no ancestry walks.
+        Assert.InRange(lookups.HashCalls, 1, 2 * vertexCount + edgeCount);
+        Assert.Equal(vertexCount, countedSource.FetchCount);
+        Assert.Equal(vertexCount, destination.ExistsCount);
+        Assert.Equal(vertexCount, destination.PushCount);
+        Assert.True(await destination.ExistsAsync(previous!, deadline.Token));
+    }
+
     private static async Task CopySharedLayerGraphAsync(bool prepopulateLayer, int concurrency = 3)
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
@@ -1120,6 +1458,35 @@ public class CopyTest
         {
             Interlocked.Increment(ref _hashCalls);
             return value.GetHashCode();
+        }
+    }
+
+    private sealed class CountingStorage(IStorage store) : IStorage
+    {
+        private int _fetchCount;
+        private int _existsCount;
+        private int _pushCount;
+
+        internal int FetchCount => Volatile.Read(ref _fetchCount);
+        internal int ExistsCount => Volatile.Read(ref _existsCount);
+        internal int PushCount => Volatile.Read(ref _pushCount);
+
+        public Task<Stream> FetchAsync(Descriptor target, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _fetchCount);
+            return store.FetchAsync(target, cancellationToken);
+        }
+
+        public Task<bool> ExistsAsync(Descriptor target, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _existsCount);
+            return store.ExistsAsync(target, cancellationToken);
+        }
+
+        public Task PushAsync(Descriptor expected, Stream content, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _pushCount);
+            return store.PushAsync(expected, content, cancellationToken);
         }
     }
 

@@ -12,7 +12,6 @@
 // limitations under the License.
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -65,25 +64,8 @@ public static class ReadOnlyGraphStorageExtensions
             Source = src
         };
 
-        // Use semaphore for concurrency control
-        using var limiter = new SemaphoreSlim(opts.Concurrency, opts.Concurrency);
-
-        // Track nodes being copied to avoid duplicate work across parallel root copies
-        var copied = new ConcurrentDictionary<BasicDescriptor, Lazy<Task>>();
-        var parents = new Dictionary<BasicDescriptor, List<BasicDescriptor>>();
-        var nodesWithSuccessors = new HashSet<BasicDescriptor>();
-
-        // Copy the sub-DAGs rooted by the root nodes
-        var copyTasks = new List<Task>();
-        foreach (var root in roots)
-        {
-            copyTasks.Add(Task.Run(
-                () => src.CopyGraphAsync(
-                    dst, root, proxy, opts, limiter, copied, parents, nodesWithSuccessors, cancellationToken),
-                cancellationToken));
-        }
-
-        await Task.WhenAll(copyTasks).ConfigureAwait(false);
+        var operation = new CopyGraphOperation(dst, proxy, opts);
+        await operation.RunAsync(roots, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
